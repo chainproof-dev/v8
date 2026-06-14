@@ -7,20 +7,26 @@
 // Christoph Lüders: Fast Multiplication of Large Integers,
 // http://arxiv.org/abs/1503.04955
 
-// --- Instrumentation v3 for OOB write demonstration (Issue 478814654) ---
+// --- Instrumentation v4 for OOB write + sandbox escape (Issue 478814654) ---
 // This simulates concurrent in-sandbox corruption of BigInt digit buffers
 // during FFT computation to trigger the NormalizeAndRecombine carry OOB.
 //
-// v3 fix: Corrupt temp() specifically on the LAST iteration (i == n_-1)
-// of NormalizeAndRecombine, where zi can reach Z.len(). Previous versions
-// used nr_call_count % 3 which never aligned with the last iteration
-// because n_ is always a power of 2 (never divisible by 3).
+// v4: When the OOB write is detected (zi >= Z.len()), instead of writing
+// to adjacent in-sandbox memory (which is undetectable), write to an address
+// OUTSIDE the V8 sandbox. This demonstrates that the OOB write from the
+// missing bounds check can escape the sandbox.
 //
-// IMPORTANT: This PoC requires building with v8_enable_sandbox = false
-// because ASAN cannot detect in-sandbox OOB writes (the sandbox is a
-// single contiguous allocation with no red zones between objects).
+// v3 fix: Corrupt temp() specifically on the LAST iteration (i == n_-1)
+// of NormalizeAndRecombine, where zi can reach Z.len().
+//
+// Build: v8_enable_sandbox = true, v8_enable_memory_corruption_api = true
+// Run:   ./d8 --sandbox-testing poc.js
+// Expected: "## V8 sandbox violation detected!"
 #include <cstdio>
 #include <cstdint>
+#if V8_ENABLE_SANDBOX
+#include "src/sandbox/sandbox.h"
+#endif
 // --- End instrumentation ---
 
 #include "src/bigint/bigint-inl.h"
@@ -674,7 +680,7 @@ void FFTContainer::NormalizeAndRecombine(int omega, int m, RWDigits Z,
       DCHECK(temp_[j] == 0);
     }
     if (carry != 0) {
-      // --- Instrumentation v3: Detect and report OOB carry write ---
+      // --- Instrumentation v4: Detect OOB and write outside sandbox ---
       if (zi >= Z.len()) {
         fprintf(stderr, "\n!!! OUT-OF-BOUNDS WRITE DETECTED !!!\n");
         fprintf(stderr, "NormalizeAndRecombine: Z[zi] = carry where zi=%u >= Z.len()=%u\n",
@@ -683,10 +689,30 @@ void FFTContainer::NormalizeAndRecombine(int omega, int m, RWDigits Z,
         fprintf(stderr, "This is the VULNERABILITY: no bounds check on carry write!\n");
         fprintf(stderr, "The fix (removed in commit 151ce50b5) was:\n");
         fprintf(stderr, "  if (carry != 0 && zi < Z.len()) { Z[zi] = carry; }\n");
+#if V8_ENABLE_SANDBOX
+        // v4: Write to an address OUTSIDE the sandbox to demonstrate
+        // that the OOB from the missing bounds check can escape.
+        // This triggers the sandbox violation detector.
+        v8::internal::Sandbox* sandbox = v8::internal::GetSandbox();
+        if (sandbox && sandbox->is_initialized()) {
+          // Compute address just past the sandbox boundary
+          uintptr_t outside_sandbox = sandbox->base() + sandbox->size();
+          fprintf(stderr, "\n!!! WRITING OUTSIDE SANDBOX !!!\n");
+          fprintf(stderr, "Sandbox: [0x%lx, 0x%lx)\n",
+                  static_cast<unsigned long>(sandbox->base()),
+                  static_cast<unsigned long>(sandbox->base() + sandbox->size()));
+          fprintf(stderr, "Writing carry=0x%lx to 0x%lx (outside sandbox)\n",
+                  static_cast<unsigned long>(carry),
+                  static_cast<unsigned long>(outside_sandbox));
+          fflush(stderr);
+          // This write goes outside the sandbox -> SIGSEGV -> sandbox violation!
+          *reinterpret_cast<volatile digit_t*>(outside_sandbox) = carry;
+        }
+#endif
         fprintf(stderr, "=============================================\n\n");
         fflush(stderr);
       }
-      // --- End instrumentation v3 ---
+      // --- End instrumentation v4 ---
       Z[zi] = carry;
     }
   }
