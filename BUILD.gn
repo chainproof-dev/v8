@@ -7603,10 +7603,6 @@ v8_source_set("v8_bigint") {
   }
 
   configs = [ ":internal_config" ]
-
-  # --- Instrumentation: needed for sandbox.h include in mul-fft.cc ---
-  deps = [ ":v8_abseil" ]
-  # --- End instrumentation ---
 }
 
 v8_header_set("v8_heap_base_headers") {
