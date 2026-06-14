@@ -7,10 +7,20 @@
 // Christoph Lüders: Fast Multiplication of Large Integers,
 // http://arxiv.org/abs/1503.04955
 
-// --- Instrumentation for OOB write demonstration (Issue 478814654) ---
+// --- Instrumentation v3 for OOB write demonstration (Issue 478814654) ---
 // This simulates concurrent in-sandbox corruption of BigInt digit buffers
 // during FFT computation to trigger the NormalizeAndRecombine carry OOB.
-#include <cstdlib>
+//
+// v3 fix: Corrupt temp() specifically on the LAST iteration (i == n_-1)
+// of NormalizeAndRecombine, where zi can reach Z.len(). Previous versions
+// used nr_call_count % 3 which never aligned with the last iteration
+// because n_ is always a power of 2 (never divisible by 3).
+//
+// IMPORTANT: This PoC requires building with v8_enable_sandbox = false
+// because ASAN cannot detect in-sandbox OOB writes (the sandbox is a
+// single contiguous allocation with no red zones between objects).
+#include <cstdio>
+#include <cstdint>
 // --- End instrumentation ---
 
 #include "src/bigint/bigint-inl.h"
@@ -488,26 +498,12 @@ class FFTContainer {
 
 inline void CopyAndZeroExtend(digit_t* dst, const digit_t* src,
                               int digits_to_copy, size_t total_bytes) {
-  // --- Instrumentation: Simulate concurrent in-sandbox corruption ---
-  // Unconditionally corrupt source digits to force carries in FFT.
-  // This simulates a malicious Worker thread modifying in-sandbox
-  // BigInt digit buffers during an ongoing FFT computation.
-  // Using 100% corruption rate on ~10% of digits for maximum carry overflow.
-  {
-    static int call_count = 0;
-    call_count++;
-    // Corrupt after the first few calls (which are for FFT setup)
-    // to ensure the FFT is already running when corruption happens.
-    if (call_count > 10) {
-      for (int i = 0; i < digits_to_copy; i++) {
-        if ((std::rand() % 10) == 0) {
-          digit_t* writable_src = const_cast<digit_t*>(src);
-          writable_src[i] = static_cast<digit_t>(-1);
-        }
-      }
-    }
-  }
-  // --- End instrumentation ---
+  // --- v3: CopyAndZeroExtend corruption removed ---
+  // Previous versions corrupted source digits here, but this was unreliable
+  // (std::rand() % 10 timing) and could crash before reaching
+  // NormalizeAndRecombine. The v3 approach corrupts NormalizeAndRecombine
+  // directly on the last iteration for guaranteed OOB trigger.
+  // --- End v3 change ---
 
   size_t bytes_to_copy = digits_to_copy * sizeof(digit_t);
   memcpy(dst, static_cast<const void*>(src), bytes_to_copy);
@@ -650,21 +646,24 @@ void FFTContainer::NormalizeAndRecombine(int omega, int m, RWDigits Z,
   for (uint32_t i = 0; i < n_; i++, z_index += chunk_size) {
     digit_t* part = part_[i];
     ShiftModFn(temp(), part, shift, K_);
-    // --- Instrumentation: Simulate concurrent corruption ---
-    // Force temp values to be all-max, guaranteeing carry overflow
-    // past Z.len() in the addition loop below.
-    {
-      static int nr_call_count = 0;
-      nr_call_count++;
-      // Only corrupt some iterations to ensure Z is partially filled
-      // so that zi can reach Z.len() while carry is still non-zero
-      if (nr_call_count > 1 && (nr_call_count % 3 == 0)) {
-        for (uint32_t k = 0; k < length_; k++) {
-          temp()[k] = static_cast<digit_t>(-1);  // 0xFFFF...FFFF
-        }
+    // --- Instrumentation v3: Corrupt LAST iteration for guaranteed OOB ---
+    // On the last iteration (i == n_-1), zi can reach Z.len().
+    // By setting temp() to all-max, any non-zero Z[zi] from previous
+    // iterations causes carry=1, which persists until zi == Z.len(),
+    // triggering the vulnerable Z[zi] = carry write past the buffer end.
+    //
+    // This simulates concurrent in-sandbox mutation of FFT result parts
+    // by another thread (e.g., GC callback, SharedArrayBuffer Worker).
+    if (i == n_ - 1) {
+      fprintf(stderr, "\n=== VULNERABILITY TRIGGER ===\n");
+      fprintf(stderr, "NormalizeAndRecombine: Corrupting last iteration (i=%u, n_=%u)\n", i, n_);
+      fprintf(stderr, "z_index=%u, Z.len()=%u, length_=%u\n", z_index, Z.len(), length_);
+      fflush(stderr);
+      for (uint32_t k = 0; k < length_; k++) {
+        temp()[k] = static_cast<digit_t>(-1);  // 0xFFFF...FFFF
       }
     }
-    // --- End instrumentation ---
+    // --- End instrumentation v3 ---
     digit_t carry = 0;
     uint32_t zi = z_index;
     uint32_t j = 0;
@@ -675,6 +674,19 @@ void FFTContainer::NormalizeAndRecombine(int omega, int m, RWDigits Z,
       DCHECK(temp_[j] == 0);
     }
     if (carry != 0) {
+      // --- Instrumentation v3: Detect and report OOB carry write ---
+      if (zi >= Z.len()) {
+        fprintf(stderr, "\n!!! OUT-OF-BOUNDS WRITE DETECTED !!!\n");
+        fprintf(stderr, "NormalizeAndRecombine: Z[zi] = carry where zi=%u >= Z.len()=%u\n",
+                zi, Z.len());
+        fprintf(stderr, "carry = 0x%016" PRIxPTR "\n", static_cast<uintptr_t>(carry));
+        fprintf(stderr, "This is the VULNERABILITY: no bounds check on carry write!\n");
+        fprintf(stderr, "The fix (removed in commit 151ce50b5) was:\n");
+        fprintf(stderr, "  if (carry != 0 && zi < Z.len()) { Z[zi] = carry; }\n");
+        fprintf(stderr, "=============================================\n\n");
+        fflush(stderr);
+      }
+      // --- End instrumentation v3 ---
       Z[zi] = carry;
     }
   }
