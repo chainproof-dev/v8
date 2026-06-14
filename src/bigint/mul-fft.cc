@@ -7,6 +7,14 @@
 // Christoph Lüders: Fast Multiplication of Large Integers,
 // http://arxiv.org/abs/1503.04955
 
+// --- Instrumentation for OOB write demonstration (Issue 478814654) ---
+// This simulates concurrent in-sandbox corruption of BigInt digit buffers
+// during FFT computation to trigger the NormalizeAndRecombine carry OOB.
+#include "src/sandbox/sandbox.h"
+#include <cstdlib>
+#include <unistd.h>
+// --- End instrumentation ---
+
 #include "src/bigint/bigint-inl.h"
 #include "src/bigint/bigint-internal.h"
 #include "src/bigint/util.h"
@@ -482,6 +490,21 @@ class FFTContainer {
 
 inline void CopyAndZeroExtend(digit_t* dst, const digit_t* src,
                               int digits_to_copy, size_t total_bytes) {
+  // --- Instrumentation: Simulate concurrent in-sandbox corruption ---
+  // Randomly corrupt source digits that are inside the sandbox.
+  // This simulates a malicious Worker thread modifying in-sandbox
+  // BigInt digit buffers during an ongoing FFT computation.
+  uintptr_t src_addr = reinterpret_cast<uintptr_t>(src);
+  if (v8::internal::InsideSandbox(src_addr)) {
+    for (int i = 0; i < digits_to_copy; i++) {
+      if ((std::rand() % 10) == 0) {
+        digit_t* writable_src = const_cast<digit_t*>(src);
+        writable_src[i] = static_cast<digit_t>(-1);
+      }
+    }
+  }
+  // --- End instrumentation ---
+
   size_t bytes_to_copy = digits_to_copy * sizeof(digit_t);
   memcpy(dst, static_cast<const void*>(src), bytes_to_copy);
   memset(dst + digits_to_copy, 0, total_bytes - bytes_to_copy);
