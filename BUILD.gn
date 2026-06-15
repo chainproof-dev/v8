@@ -7604,11 +7604,10 @@ v8_source_set("v8_bigint") {
 
   configs = [ ":internal_config" ]
 
-  # --- Instrumentation v4: Need sandbox headers for OOB detection ---
-  if (v8_enable_sandbox) {
-    deps = [ ":v8_sandbox" ]
-  }
-  # --- End instrumentation v4 ---
+  # --- v5: No sandbox dependency needed ---
+  # CopyAndZeroExtend corruption + new digit_t[] allocator means
+  # ASAN detects the OOB write naturally. No sandbox.h include needed.
+  # --- End v5 ---
 }
 
 v8_header_set("v8_heap_base_headers") {

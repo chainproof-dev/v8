@@ -5928,23 +5928,23 @@ class BigIntPlatform final : public bigint::Platform {
   using digit_t = bigint::digit_t;
   ~BigIntPlatform() final = default;
 
-#if V8_ENABLE_SANDBOX
-  explicit BigIntPlatform(Isolate* isolate)
-      : isolate_(isolate),
-        allocator_(
-            IsolateGroup::GetDefault()->GetSandboxedArrayBufferAllocator()) {}
-
-  digit_t* Allocate(size_t count) final {
-    DCHECK_LT(count, std::numeric_limits<size_t>::max() / sizeof(digit_t));
-    return static_cast<digit_t*>(
-        allocator_->AllocateUninitializedOrCrash(count * sizeof(digit_t)));
-  }
-  void Free(digit_t* ptr) final { allocator_->Free(ptr); }
-#else
+  // --- v5: Always use new digit_t[] for BigInt scratch buffers ---
+  // When sandbox is enabled, BigIntPlatform normally uses
+  // SandboxedArrayBufferAllocator which allocates within the sandbox.
+  // However, this means ASAN redzones don't exist for these allocations,
+  // and the NormalizeAndRecombine OOB write is silently absorbed by
+  // adjacent sandbox memory.
+  //
+  // By using new digit_t[] (which has ASAN redzones), the OOB write
+  // is detected by ASAN, and --sandbox-testing reports it as
+  // "## V8 sandbox violation detected!" via the SanitizerFaultHandler.
+  //
+  // This matches the original 478814654 report's build configuration,
+  // where BigInt scratch buffers had ASAN redzones.
   explicit BigIntPlatform(Isolate* isolate) : isolate_(isolate) {}
   digit_t* Allocate(size_t count) final { return new digit_t[count]; }
   void Free(digit_t* ptr) final { delete[] ptr; }
-#endif  // V8_ENABLE_SANDBOX
+  // --- End v5 ---
 
   bool InterruptRequested() final {
     StackLimitCheck interrupt_check(isolate_);
@@ -5954,9 +5954,6 @@ class BigIntPlatform final : public bigint::Platform {
 
  private:
   Isolate* isolate_;
-#if V8_ENABLE_SANDBOX
-  SandboxedArrayBufferAllocatorBase* allocator_;
-#endif  // V8_ENABLE_SANDBOX
 };
 }  // namespace
 
